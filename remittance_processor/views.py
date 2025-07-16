@@ -3,6 +3,8 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 import io
+from django.http import HttpResponseRedirect
+from django.urls import reverse
 from django.shortcuts import render
 from django.http import HttpResponse
 from django.contrib import messages
@@ -52,14 +54,9 @@ def load_remittance(file):
                 logs.append(f"Warning: Non-numeric values found in {col} (converted to 0):")
                 logs.append(str(df[df[col].isna()][['DocCode', 'DocType', 'BranchCode', col]].head(MAX_DISPLAY_ROWS)))
         
+        # Keep BranchCode as-is and ensure InvoiceClaimNo is text without .0
         df['BranchCode'] = df['BranchCode'].astype(str).str.strip()
-        df['BranchCode'] = df['BranchCode'].apply(
-            lambda x: ('0' + x.split('-')[-1].lstrip('0')).zfill(5) if 'G' in x.split('-')[-1]
-            else x.split('-')[-1].zfill(5) if x.split('-')[-1].replace('G', '').isdigit()
-            else x.zfill(5) if x.replace('G', '').isdigit() or ('G' in x and x[1:].replace('G', '').isdigit())
-            else x
-        )
-        df['InvoiceClaimNo'] = df['InvoiceClaimNo'].astype(str).str.strip()
+        df['InvoiceClaimNo'] = df['InvoiceClaimNo'].astype(str).str.strip().str.replace(r'\.0+$', '', regex=True)
         for col in ['BranchCode', 'InvoiceClaimNo']:
             if df[col].isna().any() or (df[col] == '').any():
                 logs.append(f"Warning: Missing or empty {col} values:")
@@ -77,43 +74,57 @@ def load_remittance(file):
         logs.append(f"Error loading remittance file: {e}")
         raise
 
-def load_customers():
+def load_customers(company_filter=None):
     logs = []
     with connections['default'].cursor() as cursor:
-        cursor.execute("SELECT StoreCode, Account, Branch, Name, Company FROM CorporateClients")
+        query = "SELECT StoreCode, Account, Branch, Name, Company FROM CorporateClients"
+        params = []
+        if company_filter:
+            query += " WHERE Company LIKE %s"
+            params.append(f"%{company_filter}%")
+        cursor.execute(query, params)
         rows = cursor.fetchall()
         df = pd.DataFrame(rows, columns=['StoreCode', 'Account', 'Branch', 'Name', 'Company'])
-        df['StoreCode'] = df['StoreCode'].astype(str).str.zfill(5)  # Padding with zeros
+        df['StoreCode'] = df['StoreCode'].astype(str).str.zfill(5)
         duplicates = df[df['StoreCode'].duplicated(keep=False)]
         if not duplicates.empty:
             logs.append(f"Warning: Duplicate StoreCode values in CorporateClients:")
             logs.append(str(duplicates[['StoreCode', 'Account', 'Branch', 'Name', 'Company']].head(5)))
             df = df.drop_duplicates(subset='StoreCode', keep='first').reset_index(drop=True)
             logs.append(f"Deduplicated CorporateClients, now has {len(df)} records.")
-        logs.append(f"Loaded CorporateClients with {len(df)} records.")
+        logs.append(f"Loaded CorporateClients with {len(df)} records (filtered by {company_filter if company_filter else 'all companies'}).")
         logs.append(str(df.head(5)))
     return df, logs
 
 def create_pivot_from_raw_data(pmt_date):
     logs = []
     with connections['default'].cursor() as cursor:
-        # Convert pmt_date to a SQL-compatible date string
         date_str = datetime.strptime(pmt_date, '%Y-%m-%d').strftime('%Y-%m-%d')
-        query = f"SELECT MatchRef, Reference FROM CheckersMain WHERE TxDate <= CAST('{date_str}' AS DATE)"
-        cursor.execute(query)
+        query = """
+        SELECT  
+            MatchRef, 
+            Reference, 
+            CAST(TxDate AS DATE) AS TxDate,
+            MatchRef + '-' + CONVERT(varchar(10), CAST(TxDate AS DATE), 120) AS MergedDate,
+            MatchRef + '-' + FORMAT(ABS(ROUND(Amnt, 2)), '0.00') + (CASE WHEN Amnt < 0 THEN '-' ELSE '' END) AS MergedAmnt,
+            ROUND(Amnt, 2) AS Amnt
+        FROM CheckersMain
+        WHERE MatchRef IS NOT NULL
+        AND TxDate <= CAST(%s AS DATE)
+        ORDER BY MatchRef
+        """
+        cursor.execute(query, [date_str])
         rows = cursor.fetchall()
-        df = pd.DataFrame(rows, columns=['MatchRef', 'Reference'])
-        df['MatchRef'] = df['MatchRef'].astype(str).replace('nan', '')
-        df['Reference'] = df['Reference'].astype(str).replace('nan', '')
-        duplicates = df[df['MatchRef'].duplicated(keep=False)]
-        if not duplicates.empty:
-            logs.append(f"Warning: Duplicate MatchRef values in CheckersMain:")
-            logs.append(str(duplicates[['MatchRef', 'Reference']].head(5)))
-            logs.append(f"Deduplicating CheckersMain by keeping first occurrence of MatchRef.")
-            df = df.drop_duplicates(subset='MatchRef', keep='first')
-        logs.append(f"Created pivot DataFrame from CheckersMain with {len(df)} records.")
-        logs.append(str(df.head(5)))
+        # Log the raw column names from the cursor description
+        columns = [desc[0] for desc in cursor.description]
+        logs.append(f"Query returned columns: {columns}")
+        df = pd.DataFrame(rows, columns=columns)
+        df['MatchRef'] = df['MatchRef'].astype(str).str.strip()
+        df['Reference'] = df['Reference'].astype(str).str.strip()
+        logs.append(f"Created pivot DataFrame with columns: {df.columns.tolist()}")
+        logs.append(f"Sample pivot_df: {df.head().to_string()}")
     return df, logs
+
 
 def perform_checks(df, totals, customers_df):
     """Perform validation checks and insert new rows for unmatched BranchCodes."""
@@ -147,25 +158,21 @@ def perform_checks(df, totals, customers_df):
     
     logs.append("Skipped totals check — totals dropped from remittance file.")
     
-    df['StoreCode'] = df['BranchCode']
+    df['StoreCode'] = df['BranchCode'].str[-5:]  # Use last 5 characters for StoreCode
     unmatched_branches = df[~df['StoreCode'].isin(customers_df['StoreCode'])]
     if not unmatched_branches.empty:
-        logs.append(f"Unmatched BranchCodes found: {unmatched_branches['BranchCode'].unique().tolist()}")
+        logs.append(f"Unmatched BranchCodes found (last 5 chars): {unmatched_branches['StoreCode'].unique().tolist()}")
         new_rows = []
         unmatched_no_match = []
         logs.append(f"Available StoreCode values in customers_df: {customers_df['StoreCode'].astype(str).unique().tolist()}")
         logs.append(f"Available Branch values in customers_df: {customers_df['Branch'].astype(str).unique().tolist()}")
         for branch_code in unmatched_branches['BranchCode'].unique():
-            if not branch_code or not isinstance(branch_code, str) or len(branch_code) != 5:
-                errors.append(f"Invalid BranchCode: {branch_code} (skipped)")
-                unmatched_no_match.append(branch_code)
-                continue
-            store_code = branch_code
+            store_code = branch_code[-5:]  # Use last 5 chars as StoreCode
             logs.append(f"Checking BranchCode: {branch_code} (StoreCode: {store_code})")
             if store_code in customers_df['StoreCode'].values:
                 logs.append(f"StoreCode {store_code} found in customers_df['StoreCode']")
                 continue
-            search_code = branch_code[1:] if branch_code.startswith('0') and 'G' in branch_code else branch_code.lstrip('0')
+            search_code = store_code.lstrip('0')  # Remove leading zeros for search
             logs.append(f"Searching for Branch: {search_code} in customers_df['Branch']")
             match = customers_df[customers_df['Branch'].astype(str).str.strip() == search_code]
             if not match.empty:
@@ -175,8 +182,7 @@ def perform_checks(df, totals, customers_df):
                     'Account': matched_row['Account'],
                     'Branch': matched_row['Branch'],
                     'Name': matched_row['Name'],
-                    # Removed 'Company' or set a default
-                    'Company': 'Checkers'  # Default value since it's not in the view
+                    'Company': 'Checkers'  # Default value
                 }
                 new_rows.append(new_row)
                 logs.append(f"Inserting new row in customers_df for BranchCode {branch_code}: {new_row}")
@@ -225,7 +231,7 @@ def perform_checks(df, totals, customers_df):
         
         unmatched_after_update = df[~df['StoreCode'].isin(customers_df['StoreCode'])]
         if not unmatched_after_update.empty:
-            errors.append(f"Unmatched BranchCodes after update: {unmatched_after_update['BranchCode'].unique().tolist()}")
+            errors.append(f"Unmatched BranchCodes after update (last 5 chars): {unmatched_after_update['StoreCode'].unique().tolist()}")
     
     if errors:
         logs.append("Validation errors found:")
@@ -240,30 +246,84 @@ def perform_checks(df, totals, customers_df):
     return df, customers_df, logs, errors
 
 def compute_columns(df, customers_df, pivot_df, pmt_date, pmt_reference):
-    """Compute formula-based columns and create processed_df."""
+    """Compute formula-based columns and create processed_df with optimized Reference logic including Amnt match."""
     start_time = time.time()
     logs = []
     
-    df['BranchCode'] = df['BranchCode'].astype(str).replace('nan', '')
-    df['InvoiceClaimNo'] = df['InvoiceClaimNo'].astype(str).replace('nan', '')
-    df['DocCode'] = pd.to_numeric(df['DocCode'], errors='coerce').fillna(0).astype(int)
-    
-    logs.append("Checking BranchCode and InvoiceClaimNo types:")
-    for col in ['BranchCode', 'InvoiceClaimNo']:
-        logs.append(f"{col} types: {df[col].apply(type).unique()}")
-    
+    # Generate MatchRef using vectorized operation, ensuring string format
     df['MatchRef'] = np.where(
         df['DocCode'] == 21,
-        df['InvoiceClaimNo'],
-        df['BranchCode'] + df['InvoiceClaimNo']
+        df['InvoiceClaimNo'].astype(str).str.strip().str.replace(r'\.0+$', ''),
+        df['BranchCode'].str[-5:] + df['InvoiceClaimNo'].astype(str).str.strip().str.replace(r'\.0+$', '')
     )
     
-    df['Match'] = df['MatchRef'].apply(
-        lambda x: pivot_df.index[pivot_df['MatchRef'] == x].tolist()[0] + 1
-        if x in pivot_df['MatchRef'].values else pd.NA
-    )
+    # Compute Amnt as CtAmount - DtAmount
+    df['Amnt'] = df['CtAmount'] - df['DtAmount']
     
-    df['StoreCode'] = df['BranchCode']
+    # Convert dates for comparison, handling NaT
+    df['Date'] = pd.to_datetime(df['Date'], errors='coerce').fillna(pd.Timestamp('1900-01-01')).dt.strftime('%Y-%m-%d')
+    df['Date1'] = pd.to_datetime(df['Date1'], errors='coerce').fillna(pd.Timestamp('1900-01-01')).dt.strftime('%Y-%m-%d')
+    pivot_df['TxDate'] = pd.to_datetime(pivot_df['TxDate'], errors='coerce').fillna(pd.Timestamp('1900-01-01')).dt.strftime('%Y-%m-%d')
+    
+    # Debug: Log sample data and pivot_df columns
+    logs.append("Sample MatchRef, Date, Date1, Amnt:")
+    logs.append(str(df[['MatchRef', 'Date', 'Date1', 'Amnt']].head(10).to_string()))
+    logs.append(f"pivot_df columns: {pivot_df.columns.tolist()}")
+    logs.append(f"Sample pivot_df [MatchRef, MergedAmnt, Reference]: {pivot_df[['MatchRef', 'MergedAmnt', 'Reference']].head(10).to_string()}")
+    
+    # Vectorized Reference assignment with optimized merge
+    date_keys = pd.DataFrame({
+        'index': df.index,
+        'MatchRef_Date': df['MatchRef'] + '-' + df['Date'],
+        'MatchRef_Date1': df['MatchRef'] + '-' + df['Date1'],
+        'MatchRef_PmtDate': df['MatchRef'] + '-' + pmt_date,
+        'MatchRef_Amnt': df['MatchRef'] + '-' + df['Amnt'].round(2).astype(str).str.replace(r'\.0+$', '')
+    })
+    
+    # Check and adjust pivot_expanded based on available columns
+    merge_cols = ['MergedDate', 'MergedAmnt', 'Reference']
+    if not all(col in pivot_df.columns for col in ['MergedDate', 'MergedAmnt']):
+        logs.append("Warning: MergedDate or MergedAmnt not found, falling back to Merged.")
+        merge_cols = ['Merged', 'Merged', 'Reference']  # Temporary fallback if new columns missing
+    pivot_expanded = pivot_df[merge_cols].copy()
+    merge_cols[0] = 'MergedDate'  # Use MergedDate as the primary merge key
+    
+    merged_df = date_keys.merge(pivot_expanded, left_on='MatchRef_Date', right_on=merge_cols[0], how='left', suffixes=('', '_date'))
+    merged_df = merged_df.merge(pivot_expanded, left_on='MatchRef_Date1', right_on=merge_cols[0], how='left', suffixes=('_date', '_date1'))
+    merged_df = merged_df.merge(pivot_expanded, left_on='MatchRef_PmtDate', right_on=merge_cols[0], how='left', suffixes=('_date1', '_pmt'))
+    merged_df = merged_df.merge(pivot_expanded, left_on='MatchRef_Amnt', right_on=merge_cols[1], how='left', suffixes=('_pmt', '_amnt'))
+    
+    # Debug: Log sample of merge keys and results
+    logs.append("Sample date_keys [MatchRef_Amnt]:")
+    logs.append(str(date_keys[['MatchRef_Amnt']].head(10).to_string()))
+    logs.append("Sample pivot_expanded [MergedAmnt]:")
+    logs.append(str(pivot_expanded[['MergedAmnt']].head(10).to_string()))
+    
+    # Ensure all Reference columns are present, filling with NaN if missing
+    reference_cols = ['Reference_date', 'Reference_date1', 'Reference_pmt', 'Reference_amnt']
+    for col in reference_cols:
+        if col not in merged_df.columns:
+            merged_df[col] = np.nan
+    
+    # Keep only the first match per original index to avoid duplication
+    merged_df = merged_df.drop_duplicates(subset='index', keep='first')
+    
+    # Join back to original df using index
+    df = df.reset_index().merge(merged_df[['index'] + reference_cols], on='index', how='left').set_index('index')
+    
+    # Assign Reference based on priority: PmtDate, Date, Date1, Amnt, then fallback
+    mask_pmt = df['Reference_pmt'].notna()
+    mask_date = ~mask_pmt & df['Reference_date'].notna()
+    mask_date1 = ~mask_pmt & ~mask_date & df['Reference_date1'].notna()
+    mask_amnt = ~mask_pmt & ~mask_date & ~mask_date1 & df['Reference_amnt'].notna()
+    df['Reference'] = df['Reference_pmt'].fillna(df['Reference_date']).fillna(df['Reference_date1']).fillna(df['Reference_amnt'])
+    df.loc[~mask_pmt & ~mask_date & ~mask_date1 & ~mask_amnt, 'Reference'] = df.loc[~mask_pmt & ~mask_date & ~mask_date1 & ~mask_amnt, 'BranchCode'].str.strip() + '-' + df.loc[~mask_pmt & ~mask_date & ~mask_date1 & ~mask_amnt, 'InvoiceClaimNo'].str.strip()
+    
+    # Clean up temporary columns
+    df.drop(columns=reference_cols, errors='ignore', inplace=True)
+    
+    # Use last 5 chars of BranchCode for StoreCode and map EvoAccount
+    df['StoreCode'] = df['BranchCode'].str[-5:]
     customers_df['StoreCode'] = customers_df['StoreCode'].astype(str)
     df['EvoAccount'] = df['StoreCode'].map(customers_df.set_index('StoreCode')['Account'])
     
@@ -271,20 +331,13 @@ def compute_columns(df, customers_df, pivot_df, pmt_date, pmt_reference):
         logs.append("Warning: NaN values in EvoAccount after mapping:")
         logs.append(str(df[df['EvoAccount'].isna()][['BranchCode', 'StoreCode', 'EvoAccount']].head(MAX_DISPLAY_ROWS)))
     
-    pivot_df = pivot_df.drop_duplicates(subset='MatchRef', keep='first')
-    df['Reference'] = np.where(
-        df['MatchRef'].isin(pivot_df['MatchRef']),
-        df['MatchRef'].map(pivot_df.set_index('MatchRef')['Reference']),
-        df['BranchCode'] + '-' + df['InvoiceClaimNo']
-    )
-    
     df['PmtDate'] = pmt_date
     df['PmtReference'] = pmt_reference
     df['Module'] = 'AR'
     
-    df['TrnCode'] = (df['CtAmount'] - df['DtAmount']).apply(lambda x: 'PMT' if pd.notna(x) and x > 0 else 'PMTDT')
+    df['TrnCode'] = np.where(df['CtAmount'] - df['DtAmount'] > 0, 'PMT', 'PMTDT')
     
-    processed_df = df[['MatchRef', 'Match', 'EvoAccount', 'Reference', 'PmtDate', 'PmtReference', 'Module', 'TrnCode', 
+    processed_df = df[['MatchRef', 'EvoAccount', 'Reference', 'PmtDate', 'PmtReference', 'Module', 'TrnCode', 
                       'DtAmount', 'CtAmount', 'Discount Amnt']].copy()
     
     logs.append("TrnCode distribution in processed_df:")
@@ -295,20 +348,6 @@ def compute_columns(df, customers_df, pivot_df, pmt_date, pmt_reference):
     logs.append(f"Computed columns and created processed_df in {time.time() - start_time:.2f} seconds.")
     logs.append(str(processed_df.head(MAX_DISPLAY_ROWS)))
     return df, processed_df, logs
-
-def display_remittance_totals(df):
-    """Calculate totals for DtAmount, CtAmount, Discount Amnt, and NettAmnt."""
-    totals = {
-        'DtAmount': df['DtAmount'].sum(),
-        'CtAmount': df['CtAmount'].sum(),
-        'Discount Amnt': df['Discount Amnt'].sum(),
-        'NettAmnt': (df['CtAmount'] - df['DtAmount'] - df['Discount Amnt']).sum()
-    }
-    logs = []
-    logs.append("\nRemittance Totals:")
-    for col, total in totals.items():
-        logs.append(f"Total {col}: {total:.2f}")
-    return totals, logs
 
 def generate_total_import(processed_df, remittance_totals):
     """Generate the total per customer import file from processed_df."""
@@ -372,9 +411,10 @@ def generate_detail_import(processed_df):
     """Generate the detail import file from processed_df."""
     start_time = time.time()
     logs = []
-    
+    MAX_DISPLAY_ROWS = 5
+
     processed_df['Amnt'] = processed_df['DtAmount'] - processed_df['CtAmount']
-    
+
     detail_df = processed_df[['PmtDate', 'EvoAccount', 'Reference', 'PmtReference', 
                              'DtAmount', 'CtAmount', 'Amnt']].copy()
     detail_df.rename(columns={
@@ -382,9 +422,10 @@ def generate_detail_import(processed_df):
         'CtAmount': 'Sum of CtAmount',
         'Amnt': 'Sum of Amnt'
     }, inplace=True)
-    
-    logs.append(f"Detail import preview (generated in {time.time() - start_time:.2f} seconds):")
-    logs.append(str(detail_df.head(MAX_DISPLAY_ROWS)))
+
+    logs.append("Validating Reference in detail import:")
+    logs.append(str(detail_df[['PmtDate', 'EvoAccount', 'Reference', 'PmtReference']].head(MAX_DISPLAY_ROWS)))
+    logs.append(f"Detail import generated in {time.time() - start_time:.2f} seconds.")
     return detail_df, logs
 
 def process_remittance_view(request):
@@ -397,30 +438,43 @@ def process_remittance_view(request):
         remittance_file = request.FILES.get('remittance_file')
         pmt_date = request.POST.get('pmt_date')
         pmt_reference = request.POST.get('pmt_reference')
+        nett_amount_input = request.POST.get('nett_amount')
+        company_filter = request.POST.get('company_filter', 'Checkers')  # Default to Checkers
 
-        if not all([remittance_file, pmt_date, pmt_reference]):
-            messages.error(request, "Remittance file, payment date, and payment reference are required.")
+        if not all([remittance_file, pmt_date, pmt_reference, nett_amount_input]):
+            messages.error(request, "Remittance file, payment date, payment reference, and nett amount are required.")
             return render(request, 'remittance_processor/index.html', {'logs': logs, 'errors': errors})
 
-        # Load remittance (unchanged)
+        # Load remittance
         remittance_df, totals_df, remittance_logs = load_remittance(remittance_file)
         logs.extend(remittance_logs)
 
-        # Load customers from CorporateClients view
-        customers_df, customers_logs = load_customers()
+        # Load customers with company filter
+        customers_df, customers_logs = load_customers(company_filter)
         logs.extend(customers_logs)
 
         # Load pivot from CheckersMain view with date filter
         pivot_df, pivot_logs = create_pivot_from_raw_data(pmt_date)
         logs.extend(pivot_logs)
 
-        # Rest of the processing (perform_checks, compute_columns, etc.) remains unchanged
+        # Display totals to get NettAmnt
+        totals, totals_logs = display_remittance_totals(remittance_df)
+        logs.extend(totals_logs)
+
+        # Validate nett amount
+        try:
+            nett_amount_input = float(nett_amount_input)
+            nett_amount_calculated = totals.get('NettAmnt', 0)
+            if abs(nett_amount_input - nett_amount_calculated) > 0.01:
+                return HttpResponseRedirect(f"{reverse('remittance_processor:index')}?mismatch=true&input={nett_amount_input:.2f}&calculated={nett_amount_calculated:.2f}")
+        except ValueError:
+            messages.error(request, "Invalid nett amount format. Please enter a number.")
+            return render(request, 'remittance_processor/index.html', {'logs': logs, 'errors': errors, 'totals': totals})
+
+        # Rest of the processing
         remittance_df, customers_df, check_logs, check_errors = perform_checks(remittance_df, totals_df, customers_df)
         logs.extend(check_logs)
         errors.extend(check_errors)
-
-        totals, totals_logs = display_remittance_totals(remittance_df)
-        logs.extend(totals_logs)
 
         remittance_df, processed_df, compute_logs = compute_columns(remittance_df, customers_df, pivot_df, pmt_date, pmt_reference)
         logs.extend(compute_logs)
@@ -441,6 +495,19 @@ def process_remittance_view(request):
         'totals': totals,
         'show_download': show_download
     })
+def display_remittance_totals(df):
+    """Calculate totals for DtAmount, CtAmount, Discount Amnt, and NettAmnt."""
+    totals = {
+        'DtAmount': df['DtAmount'].sum(),
+        'CtAmount': df['CtAmount'].sum(),
+        'Discount Amnt': df['Discount Amnt'].sum(),
+        'NettAmnt': (df['CtAmount'] - df['DtAmount'] - df['Discount Amnt']).sum()
+    }
+    logs = []
+    logs.append("\nRemittance Totals:")
+    for col, total in totals.items():
+        logs.append(f"Total {col}: {total:.2f}")
+    return totals, logs
 
 def download_total_import(request):
     """Serve total_import.csv for download."""
